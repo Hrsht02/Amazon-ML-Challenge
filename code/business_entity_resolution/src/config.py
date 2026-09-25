@@ -22,14 +22,15 @@ class Paths:
 @dataclass
 class BlockingConfig:
     ann_dim:int=128
-    ann_nlist:int=16384
+    ann_nlist:int=4096
     ann_pq_m:int=16
-    ann_nprobe:int=32
+    ann_nprobe:int=64
     ann_name_k:int=80
     ann_address_k:int=60
     max_candidates_per_s1:int=80
     s1_batch_size:int=5000
     index_build_batch_size:int=50000
+    ann_train_size:int=262144
 
 @dataclass
 class ModelConfig:
