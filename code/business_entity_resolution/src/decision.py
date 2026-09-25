@@ -54,11 +54,13 @@ def apply_decisions(feat_df: pd.DataFrame, score_col: str, abs_threshold: float,
 
 
 def search_thresholds(feat_df: pd.DataFrame, score_col: str, truth: Dict[str, Set[str]],
-                       cfg: DecisionConfig, rel_margins=(0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+                       cfg: DecisionConfig, rel_margins=None
                        ) -> Tuple[float, float, float]:
     """Grid search (abs_threshold, rel_margin) directly on macro F0.5.
     Returns (best_abs_threshold, best_rel_margin, best_macro_f05)."""
     best = (cfg.min_absolute_score, 0.0, -1.0)
+    if rel_margins is None:
+        rel_margins = getattr(cfg, "relative_margins", (0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0))
     for rel_margin in rel_margins:
         for abs_t in cfg.threshold_grid:
             if abs_t < cfg.min_absolute_score:
