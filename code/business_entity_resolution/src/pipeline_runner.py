@@ -47,8 +47,12 @@ def _sample_train(train,norm,i2,i3,rd):
         if (start//bs+1)%10==0:_log(rd,"sampling_progress",rows=sum(map(len,parts)),candidate_recall=rp/tp if tp else 0)
     cand=pd.concat(parts,ignore_index=True) if parts else pd.DataFrame(columns=["source1_entity_id","candidate_id"])
     if len(cand)>MODEL.max_train_pairs:
-        cand=cand.groupby("source1_entity_id",sort=False).head(MODEL.negatives_per_positive+5).copy()
-        cand=cand.iloc[:MODEL.max_train_pairs].copy()
+        labels=np.array([int(r.candidate_id in gt.get(r.source1_entity_id,set())) for r in cand.itertuples(index=False)],dtype=np.int8)
+        pos=cand[labels==1]
+        neg=cand[labels==0]
+        take_neg=max(0,MODEL.max_train_pairs-len(pos))
+        neg=neg.sample(n=min(take_neg,len(neg)),random_state=MODEL.seed) if take_neg else neg.iloc[:0]
+        cand=pd.concat([pos,neg],ignore_index=True)
     met={"candidate_recall":rp/tp if tp else 1.0,"total_positive_pairs":tp,"recovered_positive_pairs":rp,"candidate_pairs_seen":cp,"training_pairs":len(cand)}
     _json(rd/"blocking_train_metrics.json",met);print(json.dumps(met,indent=2));return cand,gt
 
