@@ -40,12 +40,19 @@ class ANNSourceIndex:
     def build(self,force=False):
         npth=self.index_dir/f"{self.source}_name.faiss"
         apth=self.index_dir/f"{self.source}_address.faiss"
-        if not force and npth.exists() and apth.exists():
-            self.name=faiss.read_index(str(npth)); self.addr=faiss.read_index(str(apth)); return
+        meta_path=self.index_dir/f"{self.source}_meta.pkl"
+        expected_meta={"rows":len(self.df),"dim":self.cfg.ann_dim,
+                       "nlist":self.cfg.ann_nlist,"pq_m":self.cfg.ann_pq_m,
+                       "nprobe":self.cfg.ann_nprobe,"train_size":self.cfg.ann_train_size}
+        if not force and npth.exists() and apth.exists() and meta_path.exists():
+            with open(meta_path,"rb") as f: meta=pickle.load(f)
+            if all(meta.get(k)==v for k,v in expected_meta.items()):
+                self.name=faiss.read_index(str(npth)); self.addr=faiss.read_index(str(apth)); return
         self.name=self._new(); self.addr=self._new()
-        rng=np.random.default_rng(self.cfg.ann_dim+self.cfg.ann_nlist)
-        n=len(self.df); take=min(n,max(100_000,self.cfg.ann_nlist*8))
+        rng=np.random.default_rng(42 + self.cfg.ann_nlist + self.cfg.ann_pq_m)
+        n=len(self.df); take=min(n,self.cfg.ann_train_size)
         sample=rng.choice(n,take,replace=False) if n>take else np.arange(n)
+        print(f"[FAISS] Building {self.source} index: rows={n:,}, train_vectors={take:,}, nlist={self.cfg.ann_nlist:,}, nprobe={self.cfg.ann_nprobe}")
         self.name.index.train(self._vec(self.df.iloc[sample].business_name.fillna("").astype(str).map(to_alnum).tolist()))
         self.addr.index.train(self._vec(self.df.iloc[sample].business_address.fillna("").astype(str).map(to_alnum).tolist()))
         bs=self.cfg.index_build_batch_size
@@ -55,7 +62,7 @@ class ANNSourceIndex:
             self.addr.add_with_ids(self._vec(self._texts("business_address",s,e)),ids)
         faiss.write_index(self.name,str(npth)); faiss.write_index(self.addr,str(apth))
         with open(self.index_dir/f"{self.source}_meta.pkl","wb") as f:
-            pickle.dump({"rows":n,"dim":self.cfg.ann_dim},f)
+            pickle.dump(expected_meta,f)
 
     def search(self,s1_df):
         if self.name is None: raise RuntimeError("Index not built")
