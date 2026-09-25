@@ -29,7 +29,7 @@ def _audit(train,test,rd):
 
 def _sample_train(train,norm,i2,i3,rd):
     gt={sid:set(r.match_list) for sid,r in train.gt.iterrows()}
-    parts=[];tp=rp=cp=0;bs=BLOCKING.s1_batch_size
+    parts=[];tp=rp=cp=0;bs=BLOCKING.s1_batch_size; sampling_closed=False
     for start in range(0,len(train.s1),bs):
         b=train.s1.iloc[start:start+bs]
         c=pd.concat([i2.search(b),i3.search(b)],ignore_index=True)
@@ -41,11 +41,14 @@ def _sample_train(train,norm,i2,i3,rd):
             pos=g[g.candidate_id.isin(truth)]
             neg=g[~g.candidate_id.isin(truth)].sort_values("ann_similarity",ascending=False)
             keep=pd.concat([pos,neg.head(MODEL.negatives_per_positive*max(1,len(pos)) if len(pos) else 3)])
-            parts.append(keep[["source1_entity_id","candidate_id"]])
-        if sum(map(len,parts))>=MODEL.max_train_pairs: break
+            if not sampling_closed:
+                parts.append(keep[["source1_entity_id","candidate_id"]])
+                if sum(map(len,parts))>=MODEL.max_train_pairs: sampling_closed=True
         if (start//bs+1)%10==0:_log(rd,"sampling_progress",rows=sum(map(len,parts)),candidate_recall=rp/tp if tp else 0)
     cand=pd.concat(parts,ignore_index=True) if parts else pd.DataFrame(columns=["source1_entity_id","candidate_id"])
-    if len(cand)>MODEL.max_train_pairs:cand=cand.iloc[:MODEL.max_train_pairs].copy()
+    if len(cand)>MODEL.max_train_pairs:
+        cand=cand.groupby("source1_entity_id",sort=False).head(MODEL.negatives_per_positive+5).copy()
+        cand=cand.iloc[:MODEL.max_train_pairs].copy()
     met={"candidate_recall":rp/tp if tp else 1.0,"total_positive_pairs":tp,"recovered_positive_pairs":rp,"candidate_pairs_seen":cp,"training_pairs":len(cand)}
     _json(rd/"blocking_train_metrics.json",met);print(json.dumps(met,indent=2));return cand,gt
 
