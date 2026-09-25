@@ -1,39 +1,17 @@
 """
 Field normalization.
 
-Design principle from the audit: Source 1 is ~100% Latin-script while
-Source 2/3 mix in 10-28% non-Latin tokens (Devanagari, Tamil, Bengali,
-French accents). A single normalized string throws away information, so
-we keep SEVERAL representations per field and let the feature layer / model
-decide which signal to trust for a given pair:
-
-  raw            - original string, whitespace-trimmed only
-  lower          - casefolded
-  ascii_fold     - unicode NFKD + strip combining marks + drop non-ASCII
-                    (turns "Métropolitain" -> "Metropolitain", and turns
-                    Devanagari/Tamil/Bengali runs into "" - which is itself
-                    informative: a script mismatch is a feature)
-  alnum          - ascii_fold, punctuation stripped, single-spaced
-  tokens         - list of alnum tokens (len >= 2)
-  sorted_tokens  - tokens sorted alphabetically, joined (order-invariant compare)
-  suffix_stripped- alnum with a trailing legal-entity suffix removed
-  core_tokens    - suffix_stripped tokens with generic/very-common business
-                   words removed (e.g. "the", "and", "services") — used for
-                   rare-token blocking
-
-Legal suffixes are seeded with a small curated multi-country list AND
-extended by mining frequent trailing tokens from the training business
-names (data-driven, not just hard-coded), so the set generalizes past
-US/India without assuming a fixed country set.
+Provides lightweight normalization used by blocking/features. The legal
+suffix miner is deliberately bounded because iterating over every business
+name in a multi-million-row corpus in Python is prohibitively expensive.
 """
+
 from __future__ import annotations
 import re
 import unicodedata
 from collections import Counter
 from typing import Iterable, List, Set
 
-# Seed list is intentionally small and multi-jurisdiction; it is EXTENDED
-# (not replaced) by mine_legal_suffixes() at pipeline-build time.
 SEED_LEGAL_SUFFIXES = {
     "inc", "incorporated", "corp", "corporation", "co", "company",
     "llc", "llp", "lp", "pllc", "ltd", "limited", "plc",
@@ -88,31 +66,46 @@ def strip_legal_suffix(alnum_name: str, suffixes: Set[str]) -> str:
     toks = alnum_name.split(" ")
     while toks and toks[-1] in suffixes:
         toks = toks[:-1]
-    # also handle a suffix stuck as the FIRST token is rare, so only trailing
     return " ".join(toks).strip()
 
 
-def mine_legal_suffixes(business_names: Iterable[str], min_count: int = 3,
-                         max_new: int = 40) -> Set[str]:
-    """Learn additional frequent trailing tokens from training names.
+def mine_legal_suffixes(
+    business_names: Iterable[str],
+    min_count: int = 3,
+    max_new: int = 40,
+    max_sample: int = 250_000,
+) -> Set[str]:
+    """
+    Mine additional trailing tokens from a bounded sample.
 
-    Only tokens that (a) occur frequently as the LAST token of a name and
-    (b) are short-ish (legal suffixes are rarely long words) are added, to
-    avoid accidentally treating a common real business-name word as a
-    suffix.
+    The previous implementation iterated over every name in Python. With
+    5M+ rows this dominated startup time and could take a very long time.
+    A deterministic prefix/sample is sufficient for discovering common
+    trailing tokens while keeping the normalizer data-driven.
     """
     last_tok_counts = Counter()
-    for name in business_names:
+
+    # Avoid materializing the full iterable. For pandas Series, iloc slicing
+    # is cheap relative to iterating millions of Python strings.
+    if hasattr(business_names, "iloc"):
+        n = len(business_names)
+        take = min(n, max_sample)
+        names = business_names.iloc[:take]
+    else:
+        names = business_names
+
+    for name in names:
         toks = tokenize(name)
         if toks:
             last_tok_counts[toks[-1]] += 1
+
     mined = set()
     for tok, cnt in last_tok_counts.most_common():
         if cnt < min_count:
             break
         if tok in SEED_LEGAL_SUFFIXES:
             continue
-        if len(tok) <= 6:  # legal suffixes are short abbreviations/words
+        if len(tok) <= 6:
             mined.add(tok)
         if len(mined) >= max_new:
             break
@@ -120,8 +113,6 @@ def mine_legal_suffixes(business_names: Iterable[str], min_count: int = 3,
 
 
 def extract_digit_signature(s: str) -> str:
-    """Concatenated digit runs in order — a crude 'numeric fingerprint' of
-    an address (house/building numbers, PIN/ZIP if present)."""
     return "".join(_DIGIT_RE.findall(s or ""))
 
 
@@ -140,9 +131,6 @@ def char_ngrams(s: str, n_range=(2, 4)) -> Set[str]:
 
 
 class Normalizer:
-    """Bundles the suffix set (seeded + mined) and exposes a single method
-    that builds every representation for a raw string in one pass."""
-
     def __init__(self, legal_suffixes: Set[str] = None,
                  generic_words: Set[str] = None):
         self.legal_suffixes = set(SEED_LEGAL_SUFFIXES)
