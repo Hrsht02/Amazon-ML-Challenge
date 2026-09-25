@@ -23,15 +23,15 @@ def _log(rd,event,**kw):
     print(f"[{rec['time']}] {event}",kw)
 
 def _audit(train,test,rd):
-    x={"train":quick_audit(train.s1,train.s2,train.s3,train.gt),
-       "test":quick_audit(test.s1,test.s2,test.s3)}
+    x={"train":quick_audit(train["s1"],train["s2"],train["s3"],train["gt"]),
+       "test":quick_audit(test["s1"],test["s2"],test["s3"])}
     _json(rd/"audit.json",x);print(json.dumps(x,indent=2,default=str))
 
 def _sample_train(train,norm,i2,i3,rd):
-    gt={sid:set(r.match_list) for sid,r in train.gt.iterrows()}
+    gt={sid:set(r.match_list) for sid,r in train["gt"].iterrows()}
     parts=[];tp=rp=cp=0;bs=BLOCKING.s1_batch_size; sampling_closed=False
-    for start in range(0,len(train.s1),bs):
-        b=train.s1.iloc[start:start+bs]
+    for start in range(0,len(train["s1"]),bs):
+        b=train["s1"].iloc[start:start+bs]
         c=pd.concat([i2.search(b),i3.search(b)],ignore_index=True)
         if c.empty: continue
         c=c.sort_values(["source1_entity_id","candidate_id","ann_similarity"],ascending=[True,True,False]).drop_duplicates(["source1_entity_id","candidate_id"])
@@ -58,7 +58,7 @@ def _sample_train(train,norm,i2,i3,rd):
 
 def _train(train,norm,i2,i3,rd):
     cand,gt=_sample_train(train,norm,i2,i3,rd)
-    feats=compute_features_batch(cand,train.s1,train.s2,train.s3,norm)
+    feats=compute_features_batch(cand,train["s1"],train["s2"],train["s3"],norm)
     y=np.array([int(r.candidate_id in gt.get(r.source1_entity_id,set())) for r in cand.itertuples(index=False)],dtype=np.int8)
     names=[x for x in get_feature_names() if x in feats.columns]
     oof=grouped_oof_predictions(feats,y,MODEL,names);weights=np.ones(len(y))
@@ -80,20 +80,20 @@ def _predict(test,norm,clf,cal,at,rm,i2,i3,out,rd):
     out=Path(out);out.mkdir(parents=True,exist_ok=True);mp=out/"matching_results.tsv";cp=out/"candidate_pairs.tsv"
     with mp.open("w",encoding="utf8") as fm,cp.open("w",encoding="utf8") as fc:
         fm.write("source1_entity_id\tmatched_entity_ids\n");fc.write("source1_entity_id\tcandidate_entity_ids\n")
-        for start in range(0,len(test.s1),BLOCKING.s1_batch_size):
-            b=test.s1.iloc[start:start+BLOCKING.s1_batch_size]
+        for start in range(0,len(test["s1"]),BLOCKING.s1_batch_size):
+            b=test["s1"].iloc[start:start+BLOCKING.s1_batch_size]
             c=pd.concat([i2.search(b),i3.search(b)],ignore_index=True)
             if not c.empty:
                 c=c.sort_values(["source1_entity_id","candidate_id","ann_similarity"],ascending=[True,True,False]).drop_duplicates(["source1_entity_id","candidate_id"])
-                feats=compute_features_batch(c[["source1_entity_id","candidate_id"]],test.s1,test.s2,test.s3,norm)
+                feats=compute_features_batch(c[["source1_entity_id","candidate_id"]],test["s1"],test["s2"],test["s3"],norm)
                 feats["score"]=cal.transform(clf.predict_proba(feats));pred=apply_decisions(feats,"score",at,rm,DECISION)
                 cg=c.groupby("source1_entity_id").candidate_id.agg(set).to_dict()
             else: pred={};cg={}
             for sid in b.entity_id:
                 fc.write(f"{sid}\t{','.join(sorted(cg.get(sid,set())))}\n")
                 fm.write(f"{sid}\t{','.join(sorted(pred.get(sid,set())))}\n")
-            done=min(start+len(b),len(test.s1))
-            if done%50000 < len(b):_log(rd,"inference_progress",processed=done,total=len(test.s1))
+            done=min(start+len(b),len(test["s1"]))
+            if done%50000 < len(b):_log(rd,"inference_progress",processed=done,total=len(test["s1"]))
     shutil.copy2(mp,rd/"matching_results.tsv");shutil.copy2(cp,rd/"candidate_pairs.tsv")
 
 def _load(rd):
@@ -120,11 +120,11 @@ def main():
         if a.stage=="predict":
             clf,cal,norm,at,rm=_load(rd)
         else:
-            norm=fit_normalizer(train.s1,train.s2,train.s3)
-            i2,i3=build_ann_indexes(train.s2,train.s3,Path(a.output_dir)/"ann_indexes_train_v2",BLOCKING,a.force_index)
+            norm=fit_normalizer(train["s1"],train["s2"],train["s3"])
+            i2,i3=build_ann_indexes(train["s2"],train["s3"],Path(a.output_dir)/"ann_indexes_train_v2",BLOCKING,a.force_index)
             clf,cal,norm,at,rm=_train(train,norm,i2,i3,rd)
         if a.stage in ("predict","all"):
-            ti2,ti3=build_ann_indexes(test.s2,test.s3,Path(a.output_dir)/"ann_indexes_test_v2",BLOCKING,False)
+            ti2,ti3=build_ann_indexes(test["s2"],test["s3"],Path(a.output_dir)/"ann_indexes_test_v2",BLOCKING,False)
             _predict(test,norm,clf,cal,at,rm,ti2,ti3,a.output_dir,rd)
             validator=Path(a.dataset_dir).parent/"utils"/"validate_submission.py"
             if validator.exists():
