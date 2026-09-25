@@ -1,122 +1,203 @@
-# Business Entity Resolution — Pipeline
+# Business Entity Resolution — Scalable Pipeline
 
-Multi-stage, leakage-safe entity resolution pipeline: multi-strategy blocking →
-rich pairwise features → LightGBM pair classifier with grouped-CV hard-negative
-mining → isotonic calibration → entity-level decision layer (macro-F0.5-optimized
-thresholds, explicit singleton + multi-match handling) → submission files.
+This version keeps the required submission format while replacing the original
+million-row TF-IDF/NearestNeighbors blocker with a persisted FAISS IVF-PQ ANN
+blocker. FAISS uses compressed inverted-file/product-quantization indexes that
+are designed for large vector collections; this avoids materializing a huge
+5M-row sparse TF-IDF nearest-neighbor workload. The index is persisted and
+reused between experiments. FAISS is MIT licensed.
 
-No external data, APIs, or lookups are used anywhere in this pipeline — every
-signal is derived from the three provided TSV sources.
+## Required output remains unchanged
 
-## 1. Install environment
+```
+output/
+├── matching_results.tsv
+└── candidate_pairs.tsv
+```
 
-```bash
+The challenge requires one matching row for every S1 test entity, permits zero,
+one or many matches, and requires final matches to be a subset of the final
+candidate set. The runner preserves those rules.
+
+## Install
+
+```powershell
 cd code/business_entity_resolution
-python3 -m venv .venv && source .venv/bin/activate     # optional but recommended
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-## 2. Directory layout expected by the code
-
-Place (or symlink) the challenge data so that, relative to this package's
-grandparent directory (referred to below as `<root>`, i.e. the folder that
-contains both `code/` and `output/`):
-
-```
-<root>/
-├── dataset/
-│   ├── train/
-│   │   ├── train_source1.tsv
-│   │   ├── train_source2.tsv
-│   │   ├── train_source3.tsv
-│   │   └── train_ground_truth.tsv
-│   └── test/
-│       ├── test_source1.tsv
-│       ├── test_source2.tsv
-│       └── test_source3.tsv
-├── utils/
-│   └── validate_submission.py     # organizer's copy if available, else the
-│                                   # one included in this package is used
-├── output/                        # created automatically
-├── models/                        # created automatically (trained artifacts)
-└── code/business_entity_resolution/   # this package
-```
-
-`src/config.py`'s `Paths` class resolves `<root>` automatically as three
-levels up from `src/`, or pass `--dataset-dir` / `--output-dir` explicitly.
-
-## 3. Run everything (train → validate → predict → validate submission)
+For Colab:
 
 ```bash
-python3 -m src.generate_submission --stage all \
-    --dataset-dir ../../dataset \
-    --output-dir ../../output
+pip install -r requirements.txt
 ```
 
-This prints, in order: a data audit, blocking candidate-recall report,
-grouped-CV training log with hard-negative rounds, the chosen decision
-thresholds, an ablation table (rule baselines vs. the trained model vs. the
-full entity-level decision layer), a validation error-analysis sample, then
-runs inference on the test set and finally the local format validator.
-It exits non-zero if validation fails — **do not submit if this prints
-`VALIDATION FAILED`.**
+## Recommended first run
 
-## 4. Run stages independently
+Do **not** immediately spend a long run on the complete pipeline. First run:
 
 ```bash
-python3 -m src.generate_submission --stage audit    # data audit only
-python3 -m src.generate_submission --stage train     # audit + blocking + train + save artifacts
-python3 -m src.generate_submission --stage predict    # requires a prior --stage train run's artifacts
+python -m src.generate_submission --stage audit \
+  --dataset-dir ../../dataset --output-dir ../../output
 ```
 
-(`predict`-only mode reloads `models/classifier.pkl`, `models/calibrator.pkl`,
-and `models/decision_config.json` saved by a previous `train`/`all` run —
-see `src/generate_submission.py` if you want to wire that reload path in
-explicitly for a two-command train/predict split.)
-
-## 5. Validate the submission files manually
+Then run the full pipeline:
 
 ```bash
-python3 ../../utils/validate_submission.py \
-    --matching ../../output/matching_results.tsv \
-    --candidate ../../output/candidate_pairs.tsv \
-    --test-dir ../../dataset/test
+python -m src.generate_submission --stage all \
+  --dataset-dir ../../dataset --output-dir ../../output
 ```
 
-Prints `PASS` (exit 0) or a numbered list of issues (exit 1).
+Every run gets an immutable experiment directory:
 
-## 6. Reproducibility notes
+```
+output/run_history/<RUN_ID>/
+├── audit.json
+├── blocking_train_metrics.json
+├── validation_metrics.json
+├── classifier.pkl
+├── calibrator.pkl
+├── normalizer.pkl
+├── decision_config.json
+├── config.json
+├── run_manifest.json
+├── events.jsonl
+├── matching_results.tsv
+├── candidate_pairs.tsv
+└── validator.txt
+```
 
-- Random seed fixed via `RANDOM_SEED = 42` / `ModelConfig.seed` in
-  `src/config.py`, threaded through LightGBM and the GroupKFold splitter.
-- All cross-validation is **grouped by `source1_entity_id`**
-  (`sklearn.model_selection.GroupKFold`) so no S1 entity's candidate pairs
-  ever straddle the train/validation boundary within a fold.
-- `output/candidate_pairs.tsv` is written from the exact same candidate set
-  that is fed into the trained classifier for scoring — not an earlier,
-  unfiltered blocking pass — satisfying the "last stage before scoring"
-  requirement.
-- Model: LightGBM (MIT license), gradient-boosted decision trees — no
-  parameter-count concerns versus the 8B ceiling. A logistic-regression
-  fallback (`sklearn`, BSD license) is used automatically if LightGBM isn't
-  importable, so the pipeline still runs in a minimal environment.
+The root `output/matching_results.tsv` and `output/candidate_pairs.tsv`
+remain the files used for submission.
 
-## 7. Package structure
+## Re-run without losing the previous experiment
+
+Never overwrite an old run. Use a new run id:
+
+```bash
+python -m src.generate_submission --stage all \
+  --run-id experiment_02 \
+  --dataset-dir ../../dataset --output-dir ../../output
+```
+
+The ANN indexes are cached separately:
+
+```
+output/ann_indexes_train_v2/
+output/ann_indexes_test_v2/
+```
+
+If you change ANN/index parameters, rebuild them with:
+
+```bash
+python -m src.generate_submission --stage train --force-index \
+  --run-id experiment_03 \
+  --dataset-dir ../../dataset --output-dir ../../output
+```
+
+## Predict again from an existing trained run
+
+This does not retrain the model:
+
+```bash
+python -m src.generate_submission --stage predict \
+  --run-id experiment_02 \
+  --dataset-dir ../../dataset --output-dir ../../output
+```
+
+It loads the saved classifier, calibrator, normalizer and decision thresholds
+from that run.
+
+## What changed
+
+### 1. Scalable blocking
+
+The old implementation used sklearn character TF-IDF matrices plus
+NearestNeighbors over millions of records. At the actual dataset size this is
+the wrong computational shape.
+
+The new blocker:
+
+- hashes character 2–5 grams into a fixed 128-dimensional vector;
+- builds separate name and address FAISS IVF-PQ indexes for S2 and S3;
+- searches in batches;
+- keeps only the top ANN candidates per S1;
+- persists the indexes;
+- never filters by country, so unseen countries such as France remain eligible.
+
+### 2. Bounded training memory
+
+Training does not materialize every blocked pair.
+
+For each S1 entity it keeps:
+
+- all blocked positives that were recovered;
+- the strongest ANN negatives;
+- a bounded number of negatives per positive.
+
+The final training sample is capped by `max_train_pairs`.
+
+Candidate recall is recorded in `blocking_train_metrics.json`. If blocking
+recall is poor, change the ANN parameters before trusting the model score.
+
+### 3. Batch inference
+
+Test S1 is processed in batches. Features are calculated only for the current
+candidate batch, predictions are written incrementally, and every S1 entity
+gets exactly one output row.
+
+### 4. Reproducibility
+
+Every experiment saves:
+
+- exact configuration;
+- trained model;
+- calibrator;
+- fitted normalizer;
+- decision thresholds;
+- audit;
+- blocking metrics;
+- validation metrics;
+- validator output;
+- final TSVs;
+- event/progress log.
+
+This lets you compare experiment 01 vs experiment 02 without losing the
+previous output.
+
+## Important competition constraints
+
+The provided challenge specification says:
+
+- use only the supplied data;
+- do not use external entity-resolution APIs/databases/geocoding or internet
+  business lookups;
+- treat country as an open set;
+- submit the two TSV files in the required format;
+- use a final model within the stated MIT/Apache and parameter constraints.
+
+This repository follows those constraints. FAISS itself is MIT licensed.
+
+## Package layout
 
 ```
 src/
-├── config.py              # paths, seeds, all tunable hyperparameters
-├── data_loader.py          # robust TSV loading + ground-truth parsing
-├── preprocessing.py        # fits the data-driven Normalizer, quick audits
-├── normalization.py        # multi-representation text normalization
-├── blocking.py             # multi-strategy candidate generation
-├── features.py             # pairwise feature engineering
-├── models.py                # PairClassifier (LightGBM) + ScoreCalibrator
-├── training.py              # grouped-CV training + hard-negative mining
-├── calibration.py           # calibrator save/load helpers
-├── decision.py               # entity-level decision layer + threshold search
-├── inference.py              # test-set blocking→features→scoring→decisions
-├── evaluation.py             # exact macro/micro F0.5 + candidate-recall metrics
-├── error_analysis.py         # categorized FP/FN report
-└── generate_submission.py    # CLI entry point tying every stage together
+├── config.py
+├── data_loader.py
+├── preprocessing.py
+├── normalization.py
+├── blocking.py                 # legacy blocker retained for reference
+├── faiss_blocking.py           # scalable blocker used by the CLI
+├── batch_features.py
+├── features.py
+├── models.py
+├── training.py
+├── calibration.py
+├── decision.py
+├── evaluation.py
+├── inference.py
+├── pipeline_runner.py
+└── generate_submission.py
 ```
