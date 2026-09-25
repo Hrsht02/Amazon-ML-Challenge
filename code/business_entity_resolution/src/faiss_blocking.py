@@ -34,8 +34,8 @@ class ANNSourceIndex:
         faiss.normalize_L2(x)
         return x
 
-    def _texts(self,col):
-        return self.df[col].fillna("").astype(str).map(to_alnum).tolist()
+    def _texts(self,col,start=0,end=None):
+        return self.df[col].iloc[start:end].fillna("").astype(str).map(to_alnum).tolist()
 
     def build(self,force=False):
         npth=self.index_dir/f"{self.source}_name.faiss"
@@ -43,17 +43,16 @@ class ANNSourceIndex:
         if not force and npth.exists() and apth.exists():
             self.name=faiss.read_index(str(npth)); self.addr=faiss.read_index(str(apth)); return
         self.name=self._new(); self.addr=self._new()
-        names=self._texts("business_name"); addrs=self._texts("business_address")
         rng=np.random.default_rng(self.cfg.ann_dim+self.cfg.ann_nlist)
         n=len(self.df); take=min(n,max(100_000,self.cfg.ann_nlist*8))
         sample=rng.choice(n,take,replace=False) if n>take else np.arange(n)
-        self.name.index.train(self._vec([names[int(i)] for i in sample]))
-        self.addr.index.train(self._vec([addrs[int(i)] for i in sample]))
+        self.name.index.train(self._vec(self.df.iloc[sample].business_name.fillna("").astype(str).map(to_alnum).tolist()))
+        self.addr.index.train(self._vec(self.df.iloc[sample].business_address.fillna("").astype(str).map(to_alnum).tolist()))
         bs=self.cfg.index_build_batch_size
         for s in range(0,n,bs):
             e=min(s+bs,n); ids=np.arange(s,e,dtype="int64")
-            self.name.add_with_ids(self._vec(names[s:e]),ids)
-            self.addr.add_with_ids(self._vec(addrs[s:e]),ids)
+            self.name.add_with_ids(self._vec(self._texts("business_name",s,e)),ids)
+            self.addr.add_with_ids(self._vec(self._texts("business_address",s,e)),ids)
         faiss.write_index(self.name,str(npth)); faiss.write_index(self.addr,str(apth))
         with open(self.index_dir/f"{self.source}_meta.pkl","wb") as f:
             pickle.dump({"rows":n,"dim":self.cfg.ann_dim},f)
