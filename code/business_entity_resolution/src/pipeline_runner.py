@@ -115,20 +115,27 @@ def main():
     else:
         rid=a.run_id or time.strftime("%Y%m%d_%H%M%S");rd=_run_dir(a.output_dir,rid);rd.mkdir(parents=True,exist_ok=True)
     try:
-        train=load_split(Path(a.dataset_dir),"train");test=load_split(Path(a.dataset_dir),"test");_audit(train,test,rd)
-        if a.stage=="audit":return
-        if a.stage=="predict":
-            clf,cal,norm,at,rm=_load(rd)
-        else:
+        dataset_dir=Path(a.dataset_dir); output_dir=Path(a.output_dir)
+        if a.stage=="audit":
+            train=load_split(dataset_dir,"train");test=load_split(dataset_dir,"test");_audit(train,test,rd);return
+        if a.stage in ("train","all"):
+            train=load_split(dataset_dir,"train")
+            _audit({"s1":train["s1"],"s2":train["s2"],"s3":train["s3"],"gt":train["gt"]},
+                   {"s1":train["s1"],"s2":train["s2"],"s3":train["s3"]},rd)
             norm=fit_normalizer(train["s1"],train["s2"],train["s3"])
-            i2,i3=build_ann_indexes(train["s2"],train["s3"],Path(a.output_dir)/"ann_indexes_train_v2",BLOCKING,a.force_index)
+            i2,i3=build_ann_indexes(train["s2"],train["s3"],output_dir/"ann_indexes_train_v2",BLOCKING,a.force_index)
             clf,cal,norm,at,rm=_train(train,norm,i2,i3,rd)
         if a.stage in ("predict","all"):
-            ti2,ti3=build_ann_indexes(test["s2"],test["s3"],Path(a.output_dir)/"ann_indexes_test_v2",BLOCKING,False)
-            _predict(test,norm,clf,cal,at,rm,ti2,ti3,a.output_dir,rd)
-            validator=Path(a.dataset_dir).parent/"utils"/"validate_submission.py"
+            test=load_split(dataset_dir,"test")
+            if a.stage=="predict":
+                _audit({"s1":test["s1"],"s2":test["s2"],"s3":test["s3"],"gt":None},
+                       test,rd)
+                clf,cal,norm,at,rm=_load(rd)
+            ti2,ti3=build_ann_indexes(test["s2"],test["s3"],output_dir/"ann_indexes_test_v2",BLOCKING,False)
+            _predict(test,norm,clf,cal,at,rm,ti2,ti3,output_dir,rd)
+            validator=dataset_dir.parent/"utils"/"validate_submission.py"
             if validator.exists():
-                r=subprocess.run([sys.executable,str(validator),"--matching",str(Path(a.output_dir)/"matching_results.tsv"),"--candidate",str(Path(a.output_dir)/"candidate_pairs.tsv"),"--test-dir",str(Path(a.dataset_dir)/"test")],capture_output=True,text=True)
+                r=subprocess.run([sys.executable,str(validator),"--matching",str(output_dir/"matching_results.tsv"),"--candidate",str(output_dir/"candidate_pairs.tsv"),"--test-dir",str(dataset_dir/"test")],capture_output=True,text=True)
                 (rd/"validator.txt").write_text(r.stdout+"\n"+r.stderr);print(r.stdout)
                 if r.returncode!=0: raise RuntimeError("Submission validation failed; see run_history/<run_id>/validator.txt")
         _json(rd/"run_manifest.json",{"run_id":rid,"stage":a.stage,"dataset_dir":a.dataset_dir,"config":config_dict(),"finished":time.strftime("%Y-%m-%dT%H:%M:%S")})
