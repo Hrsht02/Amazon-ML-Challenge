@@ -58,6 +58,8 @@ def compute_features_batch_fast(candidates, s1, s2, s3, normalizer, progress_eve
     a1 = {i: normalizer.normalize_address(s1i.at[i, "business_address"]) for i in unique_s1}
     n2 = {i: normalizer.normalize_name(allc.at[i, "business_name"]) for i in unique_c}
     a2 = {i: normalizer.normalize_address(allc.at[i, "business_address"]) for i in unique_c}
+    country1 = {i: str(s1i.at[i, "country"]).strip().lower() for i in unique_s1}
+    country2 = {i: str(allc.at[i, "country"]).strip().lower() for i in unique_c}
 
     qn = [n1[i] for i in s1_ids]; cn = [n2[i] for i in c_ids]
     qa = [a1[i] for i in s1_ids]; ca = [a2[i] for i in c_ids]
@@ -107,8 +109,8 @@ def compute_features_batch_fast(candidates, s1, s2, s3, normalizer, progress_eve
     out["addr_len_ratio"] = np.divide(np.minimum(alen,blen), np.maximum(alen,blen), out=np.zeros(len(candidates),dtype=np.float32), where=np.maximum(alen,blen)>0)
     out["addr_either_non_latin"] = np.fromiter((bool(x.get("is_non_latin") or y.get("is_non_latin")) for x,y in zip(qa,ca)), dtype=np.float32)
 
-    c1 = [str(s1i.at[i, "country"]).strip().lower() for i in s1_ids]
-    c2 = [str(allc.at[i, "country"]).strip().lower() for i in c_ids]
+    c1 = [country1[i] for i in s1_ids]
+    c2 = [country2[i] for i in c_ids]
     out["country_exact"] = np.fromiter((bool(x) and x==y for x,y in zip(c1,c2)), dtype=np.float32)
     out["country_known_both"] = np.fromiter((bool(x) and bool(y) for x,y in zip(c1,c2)), dtype=np.float32)
     out["country_mismatch"] = np.fromiter((bool(x) and bool(y) and x!=y for x,y in zip(c1,c2)), dtype=np.float32)
