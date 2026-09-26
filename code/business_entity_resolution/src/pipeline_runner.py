@@ -84,7 +84,9 @@ def _sample_train(train, norm, i2, i3, rd):
     """
     state_path = _sampling_state_path(rd)
     chunk_dir = rd / "sampling_chunks"
+    checkpoint_dir = rd / "sampling_checkpoints"
     chunk_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     gt = {sid: set(r.match_list) for sid, r in train["gt"].iterrows()}
 
@@ -98,7 +100,23 @@ def _sample_train(train, norm, i2, i3, rd):
         "closed": False,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
-    if state_path.exists():
+    checkpoints = sorted(checkpoint_dir.glob("sampling_*.pkl.gz"))
+    if checkpoints:
+        latest = checkpoints[-1]
+        payload = load_pickle(latest)
+        state.update(payload["state"])
+        saved_chunk = payload.get("chunk")
+        if saved_chunk is not None and len(saved_chunk):
+            cp = chunk_dir / f"chunk_{int(state['next_start']):09d}.pkl.gz"
+            if not cp.exists():
+                saved_chunk.to_pickle(cp, compression="gzip")
+        print(
+            f"[SAMPLING] RESUMING from S1 row {state['next_start']:,}/"
+            f"{len(train['s1']):,}; sampled={state['sampled_rows']:,}; "
+            f"recall={state['rp']/state['tp'] if state['tp'] else 0:.4%}",
+            flush=True,
+        )
+    elif state_path.exists():
         state.update(json.loads(state_path.read_text()))
         print(
             f"[SAMPLING] RESUMING from S1 row {state['next_start']:,}/"
@@ -159,23 +177,24 @@ def _sample_train(train, norm, i2, i3, rd):
         )
 
         if should_checkpoint:
-            if pending:
-                chunk_id = int(batch_done)
-                chunk_path = chunk_dir / f"chunk_{chunk_id:09d}.pkl.gz"
-                if not chunk_path.exists():
-                    chunk = pd.concat(pending, ignore_index=True)
-                    chunk.to_pickle(chunk_path, compression="gzip")
-                    print(
-                        f"[SAMPLING] checkpoint chunk saved: {chunk_path.name} "
-                        f"rows={len(chunk):,}",
-                        flush=True,
-                    )
-                pending.clear()
-                pending_rows = 0
-
             state["next_start"] = batch_done
             state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             state["elapsed_sec"] = time.time() - t0
+
+            chunk = pd.concat(pending, ignore_index=True) if pending else pd.DataFrame()
+            checkpoint_path = checkpoint_dir / f"sampling_{batch_done:09d}.pkl.gz"
+            atomic_pickle(checkpoint_path, {"state": dict(state), "chunk": chunk})
+            if len(chunk):
+                chunk_path = chunk_dir / f"chunk_{batch_done:09d}.pkl.gz"
+                if not chunk_path.exists():
+                    chunk.to_pickle(chunk_path, compression="gzip")
+                print(
+                    f"[SAMPLING] atomic checkpoint saved: {checkpoint_path.name} "
+                    f"chunk_rows={len(chunk):,}",
+                    flush=True,
+                )
+            pending.clear()
+            pending_rows = 0
             atomic_json(state_path, state)
 
             recall = state["rp"] / state["tp"] if state["tp"] else 0.0
