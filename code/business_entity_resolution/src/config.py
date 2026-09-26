@@ -25,10 +25,10 @@ class BlockingConfig:
     ann_nlist:int=4096
     ann_pq_m:int=32
     ann_nprobe:int=96
-    ann_name_k:int=120
-    ann_unicode_name_k:int=120
-    ann_address_k:int=80
-    max_candidates_per_s1:int=160
+    ann_name_k:int=200
+    ann_unicode_name_k:int=200
+    ann_address_k:int=120
+    max_candidates_per_s1:int=320
     s1_batch_size:int=5000
     index_build_batch_size:int=50000
     ann_train_size:int=262144
