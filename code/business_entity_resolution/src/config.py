@@ -32,6 +32,7 @@ class BlockingConfig:
     s1_batch_size:int=5000
     index_build_batch_size:int=50000
     ann_train_size:int=262144
+    index_checkpoint_rows:int=500000
     use_faiss_gpu:bool=True
 
 @dataclass
