@@ -40,19 +40,23 @@ class PairClassifier:
         if self.backend == "lightgbm":
             base = dict(self.params)
             if self._try_gpu():
-                gpu_params = dict(base)
-                gpu_params["device_type"] = "cuda"
-                try:
-                    print("[MODEL] Trying LightGBM CUDA backend...", flush=True)
-                    self.model = lgb.LGBMClassifier(**gpu_params)
-                    self.model.fit(X, y, sample_weight=sample_weight)
-                    self.device_used = "cuda"
-                    print("[MODEL] LightGBM device=cuda", flush=True)
-                    return self
-                except Exception as e:
-                    print(f"[MODEL] CUDA unavailable/failed -> CPU fallback: {type(e).__name__}: {e}", flush=True)
-                    PairClassifier._gpu_disabled = True
-                    self.model = None
+                for device in ("cuda", "gpu"):
+                    gpu_params = dict(base)
+                    gpu_params.pop("force_col_wise", None)
+                    gpu_params["device_type"] = device
+                    try:
+                        print(f"[MODEL] Trying LightGBM device={device}...", flush=True)
+                        self.model = lgb.LGBMClassifier(**gpu_params)
+                        self.model.fit(X, y, sample_weight=sample_weight)
+                        self.device_used = device
+                        print(f"[MODEL] LightGBM device={device}", flush=True)
+                        return self
+                    except Exception as e:
+                        print(f"[MODEL] device={device} failed -> trying next backend: {type(e).__name__}: {e}", flush=True)
+                        self.model = None
+
+                PairClassifier._gpu_disabled = True
+                print("[MODEL] All GPU backends failed; disabling GPU for the rest of this run.", flush=True)
 
             base["device_type"] = "cpu"
             self.model = lgb.LGBMClassifier(**base)
