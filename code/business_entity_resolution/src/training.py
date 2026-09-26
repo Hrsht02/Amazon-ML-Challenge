@@ -9,7 +9,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score, log_loss
 
 from .config import ModelConfig
 from .models import PairClassifier
-from .features import get_feature_names
+from .features import get_feature_names, compute_pair_features
 from .normalization import Normalizer
 
 
@@ -36,7 +36,7 @@ def compute_features_for_candidates(candidates_df, s1_df, lut, normalizer: Norma
             s1_name_cache[s1_id] = normalizer.normalize_name(s1_row.business_name)
             s1_addr_cache[s1_id] = normalizer.normalize_address(s1_row.business_address)
         cand_row = lut[cand_id]
-        feats = __import__("business_entity_resolution.src.features", fromlist=["compute_pair_features"]).compute_pair_features(
+        feats = compute_pair_features(
             s1_name_cache[s1_id], s1_addr_cache[s1_id], s1_df.loc[s1_id].country,
             normalizer.normalize_name(cand_row.business_name),
             normalizer.normalize_address(cand_row.business_address),
