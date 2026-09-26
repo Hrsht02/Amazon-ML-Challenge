@@ -1,203 +1,247 @@
-# Business Entity Resolution — Scalable Pipeline
+# Business Entity Resolution — High-Recall, Resumable Pipeline
 
-This version keeps the required submission format while replacing the original
-million-row TF-IDF/NearestNeighbors blocker with a persisted FAISS IVF-PQ ANN
-blocker. FAISS uses compressed inverted-file/product-quantization indexes that
-are designed for large vector collections; this avoids materializing a huge
-5M-row sparse TF-IDF nearest-neighbor workload. The index is persisted and
-reused between experiments. FAISS is MIT licensed.
+This is the scalable pipeline for the Amazon ML Challenge business entity
+resolution task.
 
-## Required output remains unchanged
+## Required submission format
 
-```
+The final submission directory is:
+
+~~~text
 output/
 ├── matching_results.tsv
 └── candidate_pairs.tsv
-```
+~~~
 
-The challenge requires one matching row for every S1 test entity, permits zero,
-one or many matches, and requires final matches to be a subset of the final
-candidate set. The runner preserves those rules.
+The files remain TSV, with these exact headers:
 
-## Install
+~~~text
+matching_results.tsv
+source1_entity_id    matched_entity_ids
 
-```powershell
-cd code/business_entity_resolution
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+candidate_pairs.tsv
+source1_entity_id    candidate_entity_ids
+~~~
 
-For Colab:
+The runner writes exactly one row for every test Source-1 entity and checks the
+row count before marking prediction complete.
 
-```bash
-pip install -r requirements.txt
-```
+## Current pipeline
 
-## Recommended first run
+~~~text
+Source 1
+   │
+   ├── ASCII character ANN ───────┐
+   ├── Unicode character ANN ─────┤
+   └── address ANN ───────────────┘
+                  │
+                  ▼
+          candidate union
+                  │
+                  ▼
+       rich pairwise features
+                  │
+                  ▼
+       grouped 5-fold OOF
+                  │
+                  ▼
+          hard-negative rounds
+                  │
+                  ▼
+       calibrated LightGBM score
+                  │
+                  ▼
+       macro-F0.5 threshold search
+                  │
+                  ▼
+          final full model
+                  │
+                  ▼
+       test candidate prediction
+~~~
 
-Do **not** immediately spend a long run on the complete pipeline. First run:
+### High-recall blocking
 
-```bash
-python -m src.generate_submission --stage audit \
-  --dataset-dir ../../dataset --output-dir ../../output
-```
+The previous blocker used only a 128-dimensional ASCII-normalized ANN
+representation. The current blocker uses:
 
-Then run the full pipeline:
+- 512-dimensional hashed character n-grams;
+- ASCII-normalized name ANN;
+- Unicode-preserving name ANN;
+- address ANN;
+- larger retrieval pools;
+- ANN rank/similarity evidence retained as model features;
+- no country filtering, so France and other unseen countries remain eligible;
+- persisted FAISS indexes.
 
-```bash
-python -m src.generate_submission --stage all \
-  --dataset-dir ../../dataset --output-dir ../../output
-```
+The Unicode path is important because the training audit contains a substantial
+non-Latin name population.
 
-Every run gets an immutable experiment directory:
+## Crash-safe execution
 
-```
+Use the same RUN_ID when resuming.
+
+~~~text
 output/run_history/<RUN_ID>/
 ├── audit.json
+├── normalizer.pkl
+├── sampling_state.json
+├── sampling_chunks/
+├── training_candidates.pkl.gz
+├── training_features.pkl.gz
 ├── blocking_train_metrics.json
-├── validation_metrics.json
+├── oof_checkpoints/
+│   ├── round0_fold_*.npy
+│   ├── round1_fold_*.npy
+│   └── round2_fold_*.npy
 ├── classifier.pkl
 ├── calibrator.pkl
 ├── normalizer.pkl
 ├── decision_config.json
+├── validation_metrics.json
 ├── config.json
-├── run_manifest.json
 ├── events.jsonl
+├── prediction_parts/
 ├── matching_results.tsv
 ├── candidate_pairs.tsv
-└── validator.txt
-```
+└── .done_*.json
+~~~
 
-The root `output/matching_results.tsv` and `output/candidate_pairs.tsv`
-remain the files used for submission.
+If a runtime dies during candidate sampling, the next invocation resumes from
+the saved S1 position.
 
-## Re-run without losing the previous experiment
+If it dies during OOF training, completed folds are reused and only the missing
+folds are retrained.
 
-Never overwrite an old run. Use a new run id:
+If it dies during test inference, completed prediction batches are skipped.
 
-```bash
-python -m src.generate_submission --stage all \
-  --run-id experiment_02 \
-  --dataset-dir ../../dataset --output-dir ../../output
-```
+This is designed specifically for Colab runtimes, whose managed VMs can be
+terminated and have maximum lifetimes. The persistent run directory therefore
+belongs on Google Drive, not only on the temporary Colab filesystem.
 
-The ANN indexes are cached separately:
+## Progress / metrics printed during execution
 
-```
-output/ann_indexes_train_v2/
-output/ann_indexes_test_v2/
-```
+The runner continuously prints:
 
-If you change ANN/index parameters, rebuild them with:
+- current stage;
+- S1 rows processed;
+- training-pair count;
+- candidate recall;
+- candidate pairs seen;
+- elapsed time;
+- RAM/CPU/GPU telemetry;
+- feature-generation progress;
+- OOF fold progress;
+- ROC-AUC, average precision and log loss per OOF fold;
+- LightGBM device selected;
+- macro precision/recall/F0.5;
+- micro precision/recall/F0.5;
+- singleton accuracy and false-positive rate;
+- chosen absolute threshold;
+- chosen relative margin;
+- prediction progress;
+- final output paths.
 
-```bash
-python -m src.generate_submission --stage train --force-index \
-  --run-id experiment_03 \
-  --dataset-dir ../../dataset --output-dir ../../output
-```
+The complete machine-readable event stream is saved to events.jsonl.
 
-## Predict again from an existing trained run
+## CPU / GPU behavior
 
-This does not retrain the model:
+The code is CPU-safe and can run on ordinary Windows/Linux/Colab CPU runtimes.
 
-```bash
-python -m src.generate_submission --stage predict \
-  --run-id experiment_02 \
-  --dataset-dir ../../dataset --output-dir ../../output
-```
+For LightGBM, the model attempts CUDA and then the GPU backend when a CUDA-capable
+runtime is detected. If the installed LightGBM build does not support the
+requested GPU backend, it automatically falls back to CPU and disables further
+GPU attempts for that run.
 
-It loads the saved classifier, calibrator, normalizer and decision thresholds
-from that run.
+For FAISS, the standard faiss-cpu PyPI package is used for reproducibility.
+If a custom GPU-enabled FAISS build is installed, the blocker can use it for
+search and automatically retry a failed GPU search on CPU. The standard PyPI
+CPU wheel does not itself provide FAISS GPU binaries.
 
-## What changed
+A Colab runtime disappearing completely cannot be caught by Python. The recovery
+mechanism is therefore persistent checkpoints: start a new runtime, mount Drive,
+repeat setup, and execute the same RUN_ID.
 
-### 1. Scalable blocking
+## Colab
 
-The old implementation used sklearn character TF-IDF matrices plus
-NearestNeighbors over millions of records. At the actual dataset size this is
-the wrong computational shape.
+Use:
 
-The new blocker:
+~~~text
+colab/amazon_ml_challenge_resumable.ipynb
+~~~
 
-- hashes character 2–5 grams into a fixed 128-dimensional vector;
-- builds separate name and address FAISS IVF-PQ indexes for S2 and S3;
-- searches in batches;
-- keeps only the top ANN candidates per S1;
-- persists the indexes;
-- never filters by country, so unseen countries such as France remain eligible.
+Recommended Drive layout:
 
-### 2. Bounded training memory
+~~~text
+My Drive/
+└── AmazonMLChallenge/
+    ├── dataset/
+    │   ├── train/
+    │   └── test/
+    └── output/
+~~~
 
-Training does not materialize every blocked pair.
+The notebook copies the dataset to the local Colab VM for faster TSV access,
+while checkpoints, FAISS indexes and final outputs are stored under Drive.
 
-For each S1 entity it keeps:
+Run:
 
-- all blocked positives that were recovered;
-- the strongest ANN negatives;
-- a bounded number of negatives per positive.
+~~~bash
+python -u -m src.generate_submission \
+  --stage all \
+  --run-id experiment_06 \
+  --dataset-dir /content/dataset \
+  --output-dir /content/drive/MyDrive/AmazonMLChallenge/output
+~~~
 
-The final training sample is capped by `max_train_pairs`.
+After a runtime reset, run the setup cells again and use the same
+experiment_06 run ID. Do not use --force-index when resuming unless you
+intentionally want to rebuild the ANN indexes.
 
-Candidate recall is recorded in `blocking_train_metrics.json`. If blocking
-recall is poor, change the ANN parameters before trusting the model score.
+## Install locally
 
-### 3. Batch inference
+~~~powershell
+cd code/business_entity_resolution
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+~~~
 
-Test S1 is processed in batches. Features are calculated only for the current
-candidate batch, predictions are written incrementally, and every S1 entity
-gets exactly one output row.
+Then:
 
-### 4. Reproducibility
+~~~powershell
+python -m src.generate_submission --stage audit
+  --dataset-dir ../../dataset
+  --output-dir ../../output
+~~~
 
-Every experiment saves:
+Training:
 
-- exact configuration;
-- trained model;
-- calibrator;
-- fitted normalizer;
-- decision thresholds;
-- audit;
-- blocking metrics;
-- validation metrics;
-- validator output;
-- final TSVs;
-- event/progress log.
+~~~powershell
+python -m src.generate_submission --stage train
+  --run-id experiment_local_01
+  --dataset-dir ../../dataset
+  --output-dir ../../output
+~~~
 
-This lets you compare experiment 01 vs experiment 02 without losing the
-previous output.
+Prediction from an existing trained run:
 
-## Important competition constraints
+~~~powershell
+python -m src.generate_submission --stage predict
+  --run-id experiment_local_01
+  --dataset-dir ../../dataset
+  --output-dir ../../output
+~~~
 
-The provided challenge specification says:
+## Experiment discipline
 
-- use only the supplied data;
-- do not use external entity-resolution APIs/databases/geocoding or internet
-  business lookups;
-- treat country as an open set;
-- submit the two TSV files in the required format;
-- use a final model within the stated MIT/Apache and parameter constraints.
+A run ID is the unit of reproducibility.
 
-This repository follows those constraints. FAISS itself is MIT licensed.
+- Same RUN_ID = resume/reuse checkpoints.
+- New RUN_ID = new experiment.
+- --force-index = intentionally rebuild ANN indexes.
+- Never delete an old run until its metrics and artifacts have been reviewed.
 
-## Package layout
-
-```
-src/
-├── config.py
-├── data_loader.py
-├── preprocessing.py
-├── normalization.py
-├── blocking.py                 # legacy blocker retained for reference
-├── faiss_blocking.py           # scalable blocker used by the CLI
-├── batch_features.py
-├── features.py
-├── models.py
-├── training.py
-├── calibration.py
-├── decision.py
-├── evaluation.py
-├── inference.py
-├── pipeline_runner.py
-└── generate_submission.py
-```
+The current pipeline records candidate recall before model validation because
+candidate recall is the ceiling imposed by blocking: a matcher cannot recover a
+true pair that never entered the candidate set.
