@@ -1,4 +1,4 @@
-"""Central configuration for the scalable Business Entity Resolution pipeline."""
+"""Central configuration for the scalable, resumable Business Entity Resolution pipeline."""
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
@@ -21,16 +21,18 @@ class Paths:
 
 @dataclass
 class BlockingConfig:
-    ann_dim:int=128
+    ann_dim:int=512
     ann_nlist:int=4096
-    ann_pq_m:int=16
-    ann_nprobe:int=64
-    ann_name_k:int=80
-    ann_address_k:int=60
-    max_candidates_per_s1:int=80
+    ann_pq_m:int=32
+    ann_nprobe:int=96
+    ann_name_k:int=120
+    ann_unicode_name_k:int=120
+    ann_address_k:int=80
+    max_candidates_per_s1:int=160
     s1_batch_size:int=5000
     index_build_batch_size:int=50000
     ann_train_size:int=262144
+    use_faiss_gpu:bool=True
 
 @dataclass
 class ModelConfig:
@@ -40,11 +42,12 @@ class ModelConfig:
     negatives_per_positive:int=6
     hard_negative_rounds:int=2
     hard_negatives_per_s1:int=8
+    checkpoint_every_batches:int=20
     lgbm_params:dict=field(default_factory=lambda:dict(
         objective="binary",metric="binary_logloss",learning_rate=0.035,
         num_leaves=63,min_child_samples=30,feature_fraction=0.9,
         bagging_fraction=0.9,bagging_freq=1,n_estimators=700,
-        verbosity=-1,n_jobs=-1
+        verbosity=-1,n_jobs=-1,force_col_wise=True
     ))
 
 @dataclass
