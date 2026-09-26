@@ -203,7 +203,8 @@ class ANNSourceIndex:
                     rid = int(rid)
                     rec = cand.setdefault(rid, {
                         "ascii_name": 0.0, "unicode_name": 0.0, "address": 0.0,
-                        "name_rank": 10**9, "unicode_name_rank": 10**9,
+                        "ascii_name_rank": 10**9,
+                        "unicode_name_rank": 10**9,
                         "address_rank": 10**9,
                     })
                     rec[source] = max(rec[source], float(sims[i, rank - 1]))
@@ -224,7 +225,7 @@ class ANNSourceIndex:
                 rows.append((
                     sid, self.df.iloc[rid].entity_id,
                     best, rec["ascii_name"], rec["unicode_name"], rec["address"],
-                    rec["name_rank"], rec["unicode_name_rank"], rec["address_rank"],
+                    rec["ascii_name_rank"], rec["unicode_name_rank"], rec["address_rank"],
                     evidence,
                 ))
 
