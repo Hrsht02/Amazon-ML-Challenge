@@ -45,6 +45,7 @@ class ANNSourceIndex:
         self._gpu = None
         self._gpu_enabled = bool(getattr(cfg, "use_faiss_gpu", True))
         self._gpu_failed = False
+        self._gpu_count = 1
 
     def _new(self):
         q = faiss.IndexFlatIP(self.cfg.ann_dim)
@@ -69,13 +70,8 @@ class ANNSourceIndex:
         return {
             "rows": len(self.df), "dim": self.cfg.ann_dim,
             "nlist": self.cfg.ann_nlist, "pq_m": self.cfg.ann_pq_m,
-            "nprobe": self.cfg.ann_nprobe,
             "train_size": self.cfg.ann_train_size,
-            "name_k": self.cfg.ann_name_k,
-            "unicode_name_k": self.cfg.ann_unicode_name_k,
-            "address_k": self.cfg.ann_address_k,
-            "max_candidates": self.cfg.max_candidates_per_s1,
-            "version": 3,
+            "version": 4,
         }
 
     def build(self, force=False):
@@ -90,11 +86,13 @@ class ANNSourceIndex:
         if not force and all(p.exists() for p in paths.values()):
             with open(paths["meta"], "rb") as f:
                 meta = pickle.load(f)
-            if all(meta.get(k) == v for k, v in expected.items()):
+            construction_keys = ("rows", "dim", "nlist", "pq_m", "train_size")
+            if all(meta.get(k) == expected.get(k) for k in construction_keys) and int(meta.get("version", 0)) in (3, 4):
                 print(f"[FAISS] Reusing cached {self.source} indexes", flush=True)
                 self.name = faiss.read_index(str(paths["name"]))
                 self.name_unicode = faiss.read_index(str(paths["unicode"]))
                 self.addr = faiss.read_index(str(paths["addr"]))
+                self._set_nprobe_cpu()
                 return
 
         self.name = self._new()
@@ -133,12 +131,22 @@ class ANNSourceIndex:
             if ((s // bs) + 1) % 20 == 0 or e == n:
                 print(f"[FAISS] {self.source} indexed {e:,}/{n:,} rows", flush=True)
 
+        self._set_nprobe_cpu()
         faiss.write_index(self.name, str(paths["name"]))
         faiss.write_index(self.name_unicode, str(paths["unicode"]))
         faiss.write_index(self.addr, str(paths["addr"]))
         with open(paths["meta"], "wb") as f:
             pickle.dump(expected, f)
         print(f"[FAISS] {self.source} indexes saved", flush=True)
+
+    def _set_nprobe_cpu(self):
+        """Apply the current search-time nprobe to loaded CPU indexes."""
+        for idx in (self.name, self.name_unicode, self.addr):
+            try:
+                base = faiss.downcast_index(idx.index)
+                base.nprobe = int(self.cfg.ann_nprobe)
+            except Exception:
+                pass
 
     def _enable_gpu(self):
         if not self._gpu_enabled or self._gpu_failed or self._gpu is not None:
@@ -148,14 +156,25 @@ class ANNSourceIndex:
                 print("[FAISS] GPU FAISS bindings unavailable; using CPU", flush=True)
                 self._gpu_failed = True
                 return
-            res = faiss.StandardGpuResources()
-            self._gpu = {
-                "res": res,
-                "name": faiss.index_cpu_to_gpu(res, 0, self.name),
-                "unicode": faiss.index_cpu_to_gpu(res, 0, self.name_unicode),
-                "addr": faiss.index_cpu_to_gpu(res, 0, self.addr),
-            }
-            print("[FAISS] GPU search enabled", flush=True)
+            self._set_nprobe_cpu()
+            ngpu = int(getattr(faiss, "get_num_gpus", lambda: 0)())
+            self._gpu_count = max(1, ngpu)
+            if ngpu >= 2 and hasattr(faiss, "index_cpu_to_all_gpus"):
+                self._gpu = {
+                    "name": faiss.index_cpu_to_all_gpus(self.name),
+                    "unicode": faiss.index_cpu_to_all_gpus(self.name_unicode),
+                    "addr": faiss.index_cpu_to_all_gpus(self.addr),
+                }
+                print(f"[FAISS] Multi-GPU search enabled: {ngpu} GPUs", flush=True)
+            else:
+                res = faiss.StandardGpuResources()
+                self._gpu = {
+                    "res": res,
+                    "name": faiss.index_cpu_to_gpu(res, 0, self.name),
+                    "unicode": faiss.index_cpu_to_gpu(res, 0, self.name_unicode),
+                    "addr": faiss.index_cpu_to_gpu(res, 0, self.addr),
+                }
+                print("[FAISS] GPU search enabled: GPU 0", flush=True)
         except Exception as e:
             print(f"[FAISS] GPU initialization failed -> CPU fallback: {type(e).__name__}: {e}", flush=True)
             self._gpu = None
