@@ -480,25 +480,24 @@ def main():
             mark_done(rd, "audit")
             return
 
-        train = load_split(dataset_dir, "train")
-        if not is_done(rd, "audit"):
-            _audit(train, _load_train_or_empty_audit(train), rd)
-            mark_done(rd, "audit")
-
-        # Normalizer checkpoint.
-        norm_path = rd / "normalizer.pkl"
-        if norm_path.exists():
-            with open(norm_path, "rb") as f:
-                norm = pickle.load(f)
-            print("[NORMALIZER] Reused checkpoint.", flush=True)
-        else:
-            print("[NORMALIZER] Fitting bounded data-driven normalizer...", flush=True)
-            norm = fit_normalizer(train["s1"], train["s2"], train["s3"])
-            with open(norm_path, "wb") as f:
-                pickle.dump(norm, f)
-            print("[NORMALIZER] Saved.", flush=True)
-
         if a.stage in ("train", "all"):
+            train = load_split(dataset_dir, "train")
+            if not is_done(rd, "audit"):
+                _audit(train, _load_train_or_empty_audit(train), rd)
+                mark_done(rd, "audit")
+
+            norm_path = rd / "normalizer.pkl"
+            if norm_path.exists():
+                with open(norm_path, "rb") as f:
+                    norm = pickle.load(f)
+                print("[NORMALIZER] Reused checkpoint.", flush=True)
+            else:
+                print("[NORMALIZER] Fitting bounded data-driven normalizer...", flush=True)
+                norm = fit_normalizer(train["s1"], train["s2"], train["s3"])
+                with open(norm_path, "wb") as f:
+                    pickle.dump(norm, f)
+                print("[NORMALIZER] Saved.", flush=True)
+
             i2, i3 = build_ann_indexes(
                 train["s2"], train["s3"],
                 output_dir / "ann_indexes_train_v3",
@@ -511,8 +510,9 @@ def main():
             clf, cal, norm, at, rm = _load(rd)
 
         if a.stage in ("predict", "all"):
-            del train
-            gc.collect()
+            if "train" in locals():
+                del train
+                gc.collect()
             test = load_split(dataset_dir, "test")
             ti2, ti3 = build_ann_indexes(
                 test["s2"], test["s3"],
