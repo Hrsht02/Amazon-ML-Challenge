@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import pickle
+import time
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import HashingVectorizer
@@ -45,6 +47,7 @@ class ANNSourceIndex:
         self._gpu = None
         self._gpu_enabled = bool(getattr(cfg, "use_faiss_gpu", True))
         self._gpu_failed = False
+        self._gpu_count = 1
 
     def _new(self):
         q = faiss.IndexFlatIP(self.cfg.ann_dim)
@@ -53,7 +56,7 @@ class ANNSourceIndex:
             self.cfg.ann_pq_m, 8, faiss.METRIC_INNER_PRODUCT
         )
         base.nprobe = self.cfg.ann_nprobe
-        return faiss.IndexIDMap2(base)
+        return base
 
     def _vec(self, texts, unicode=False):
         vectorizer = self.vec_unicode if unicode else self.vec_ascii
@@ -69,76 +72,191 @@ class ANNSourceIndex:
         return {
             "rows": len(self.df), "dim": self.cfg.ann_dim,
             "nlist": self.cfg.ann_nlist, "pq_m": self.cfg.ann_pq_m,
-            "nprobe": self.cfg.ann_nprobe,
             "train_size": self.cfg.ann_train_size,
-            "name_k": self.cfg.ann_name_k,
-            "unicode_name_k": self.cfg.ann_unicode_name_k,
-            "address_k": self.cfg.ann_address_k,
-            "max_candidates": self.cfg.max_candidates_per_s1,
-            "version": 3,
+            "version": 5,
         }
 
-    def build(self, force=False):
-        paths = {
+    def _final_paths(self):
+        return {
             "name": self.index_dir / f"{self.source}_name.faiss",
             "unicode": self.index_dir / f"{self.source}_name_unicode.faiss",
             "addr": self.index_dir / f"{self.source}_address.faiss",
             "meta": self.index_dir / f"{self.source}_meta.pkl",
         }
+
+    def _partial_paths(self):
+        return {
+            "name": self.index_dir / f"{self.source}_name.partial.faiss",
+            "unicode": self.index_dir / f"{self.source}_name_unicode.partial.faiss",
+            "addr": self.index_dir / f"{self.source}_address.partial.faiss",
+            "state": self.index_dir / f"{self.source}_build_state.pkl",
+        }
+
+    def _gpu_resources(self, gpu_id):
+        if not hasattr(faiss, "StandardGpuResources"):
+            return None
+        res = faiss.StandardGpuResources()
+        try:
+            res.setTempMemory(512 * 1024 * 1024)
+        except Exception:
+            pass
+        return res
+
+    def _to_gpu(self, cpu_index, gpu_id, res):
+        if res is None:
+            return cpu_index
+        try:
+            return faiss.index_cpu_to_gpu(res, int(gpu_id), cpu_index)
+        except Exception as e:
+            print(f"[FAISS][{self.source}] GPU {gpu_id} build fallback -> CPU: {type(e).__name__}: {e}", flush=True)
+            return cpu_index
+
+    def _to_cpu(self, index):
+        if type(index).__name__.startswith("Gpu") and hasattr(faiss, "index_gpu_to_cpu"):
+            return faiss.index_gpu_to_cpu(index)
+        return index
+
+    def _set_nprobe_single(self, idx):
+        try:
+            base = faiss.downcast_index(idx)
+            base.nprobe = int(self.cfg.ann_nprobe)
+            return
+        except Exception:
+            pass
+        try:
+            base = faiss.downcast_index(idx.index)
+            base.nprobe = int(self.cfg.ann_nprobe)
+        except Exception:
+            pass
+
+    def _write_checkpoint(self, indexes, paths, rows_done, expected):
+        t0 = time.time()
+        for key in ("name", "unicode", "addr"):
+            cpu_idx = self._to_cpu(indexes[key])
+            self._set_nprobe_single(cpu_idx)
+            tmp = paths[key].with_suffix(paths[key].suffix + ".tmp")
+            faiss.write_index(cpu_idx, str(tmp))
+            tmp.replace(paths[key])
+        state = {"rows_added": int(rows_done), "rows": len(self.df), "version": 5, "meta": expected}
+        tmp = paths["state"].with_suffix(".tmp")
+        with open(tmp, "wb") as f:
+            pickle.dump(state, f)
+        tmp.replace(paths["state"])
+        print(f"[FAISS][{self.source}] CHECKPOINT {rows_done:,}/{len(self.df):,} saved in {time.time()-t0:.1f}s", flush=True)
+
+    def build(self, force=False, gpu_id=0):
+        paths = self._final_paths()
+        partial = self._partial_paths()
         expected = self._meta()
+        keys = ("rows", "dim", "nlist", "pq_m", "train_size")
 
         if not force and all(p.exists() for p in paths.values()):
             with open(paths["meta"], "rb") as f:
                 meta = pickle.load(f)
-            if all(meta.get(k) == v for k, v in expected.items()):
-                print(f"[FAISS] Reusing cached {self.source} indexes", flush=True)
+            if all(meta.get(k) == expected.get(k) for k in keys) and int(meta.get("version", 0)) in (3, 4, 5):
+                print(f"[FAISS][{self.source}] Reusing cached indexes", flush=True)
                 self.name = faiss.read_index(str(paths["name"]))
                 self.name_unicode = faiss.read_index(str(paths["unicode"]))
                 self.addr = faiss.read_index(str(paths["addr"]))
+                self._set_nprobe_cpu()
                 return
 
-        self.name = self._new()
-        self.name_unicode = self._new()
-        self.addr = self._new()
-
-        rng = np.random.default_rng(42 + self.cfg.ann_nlist + self.cfg.ann_pq_m)
         n = len(self.df)
-        take = min(n, self.cfg.ann_train_size)
-        sample = rng.choice(n, take, replace=False) if n > take else np.arange(n)
+        bs = int(self.cfg.index_build_batch_size)
+        checkpoint_rows = max(bs, int(getattr(self.cfg, "index_checkpoint_rows", 500_000)))
+        ngpu = int(getattr(faiss, "get_num_gpus", lambda: 0)())
+        gpu_ok = bool(getattr(self.cfg, "use_faiss_gpu", True) and ngpu > gpu_id and hasattr(faiss, "StandardGpuResources") and hasattr(faiss, "index_cpu_to_gpu"))
 
-        print(
-            f"[FAISS] Building {self.source}: rows={n:,}, train_vectors={take:,}, "
-            f"dim={self.cfg.ann_dim}, nlist={self.cfg.ann_nlist:,}, "
-            f"nprobe={self.cfg.ann_nprobe}, name_k={self.cfg.ann_name_k}, "
-            f"unicode_name_k={self.cfg.ann_unicode_name_k}, address_k={self.cfg.ann_address_k}",
-            flush=True,
-        )
+        print(f"[FAISS][{self.source}] START rows={n:,} GPU={gpu_ok} device={gpu_id} visible_gpus={ngpu} batch={bs:,} checkpoint={checkpoint_rows:,}", flush=True)
 
-        names = self.df.iloc[sample].business_name.fillna("").astype(str).tolist()
-        addrs = self.df.iloc[sample].business_address.fillna("").astype(str).tolist()
-        self.name.index.train(self._vec(names, unicode=False))
-        print(f"[FAISS] {self.source} ASCII-name quantizer trained", flush=True)
-        self.name_unicode.index.train(self._vec(names, unicode=True))
-        print(f"[FAISS] {self.source} Unicode-name quantizer trained", flush=True)
-        self.addr.index.train(self._vec(addrs, unicode=False))
-        print(f"[FAISS] {self.source} address quantizer trained", flush=True)
+        rows_done = 0
+        cpu_indexes = {}
+        if not force and all(p.exists() for p in partial.values()):
+            try:
+                with open(partial["state"], "rb") as f:
+                    state = pickle.load(f)
+                rows_done = int(state["rows_added"])
+                cpu_indexes = {k: faiss.read_index(str(partial[k])) for k in ("name", "unicode", "addr")}
+                if state.get("rows") != n or state.get("version") != 5 or any(cpu_indexes[k].ntotal != rows_done for k in cpu_indexes):
+                    raise ValueError("checkpoint metadata/index size mismatch")
+                if any(state.get("meta", {}).get(k) != expected.get(k) for k in keys):
+                    raise ValueError("checkpoint configuration mismatch")
+                print(f"[FAISS][{self.source}] RESUME from {rows_done:,}/{n:,}", flush=True)
+            except Exception as e:
+                print(f"[FAISS][{self.source}] checkpoint ignored: {type(e).__name__}: {e}", flush=True)
+                rows_done, cpu_indexes = 0, {}
 
-        bs = self.cfg.index_build_batch_size
-        for s in range(0, n, bs):
+        res = self._gpu_resources(gpu_id) if gpu_ok else None
+
+        if rows_done == 0:
+            self.name, self.name_unicode, self.addr = self._new(), self._new(), self._new()
+            rng = np.random.default_rng(42 + self.cfg.ann_nlist + self.cfg.ann_pq_m)
+            take = min(n, self.cfg.ann_train_size)
+            sample = rng.choice(n, take, replace=False) if n > take else np.arange(n)
+            print(f"[FAISS][{self.source}] TRAIN 3 indexes using {take:,} vectors", flush=True)
+            names = self.df.iloc[sample].business_name.fillna("").astype(str).tolist()
+            addrs = self.df.iloc[sample].business_address.fillna("").astype(str).tolist()
+
+            t0 = time.time(); x = self._vec(names, False)
+            self.name = self._to_gpu(self.name, gpu_id, res); self.name.train(x)
+            print(f"[FAISS][{self.source}] ASCII-name trained in {time.time()-t0:.1f}s", flush=True); del x
+
+            t0 = time.time(); x = self._vec(names, True)
+            self.name_unicode = self._to_gpu(self.name_unicode, gpu_id, res); self.name_unicode.train(x)
+            print(f"[FAISS][{self.source}] Unicode-name trained in {time.time()-t0:.1f}s", flush=True); del x
+
+            t0 = time.time(); x = self._vec(addrs, False)
+            self.addr = self._to_gpu(self.addr, gpu_id, res); self.addr.train(x)
+            print(f"[FAISS][{self.source}] Address trained in {time.time()-t0:.1f}s", flush=True); del x, names, addrs, sample
+        else:
+            self.name = self._to_gpu(cpu_indexes["name"], gpu_id, res)
+            self.name_unicode = self._to_gpu(cpu_indexes["unicode"], gpu_id, res)
+            self.addr = self._to_gpu(cpu_indexes["addr"], gpu_id, res)
+
+        started = time.time()
+        for s in range(rows_done, n, bs):
             e = min(s + bs, n)
+            t_batch = time.time()
             ids = np.arange(s, e, dtype="int64")
-            self.name.add_with_ids(self._vec(self._texts("business_name", s, e), False), ids)
-            self.name_unicode.add_with_ids(self._vec(self._texts("business_name", s, e, True), True), ids)
-            self.addr.add_with_ids(self._vec(self._texts("business_address", s, e), False), ids)
-            if ((s // bs) + 1) % 20 == 0 or e == n:
-                print(f"[FAISS] {self.source} indexed {e:,}/{n:,} rows", flush=True)
 
-        faiss.write_index(self.name, str(paths["name"]))
-        faiss.write_index(self.name_unicode, str(paths["unicode"]))
-        faiss.write_index(self.addr, str(paths["addr"]))
+            t0 = time.time(); x = self._vec(self._texts("business_name", s, e), False); v1 = time.time()-t0
+            t0 = time.time(); self.name.add_with_ids(x, ids); a1 = time.time()-t0; del x
+
+            t0 = time.time(); x = self._vec(self._texts("business_name", s, e, True), True); v2 = time.time()-t0
+            t0 = time.time(); self.name_unicode.add_with_ids(x, ids); a2 = time.time()-t0; del x
+
+            t0 = time.time(); x = self._vec(self._texts("business_address", s, e), False); v3 = time.time()-t0
+            t0 = time.time(); self.addr.add_with_ids(x, ids); a3 = time.time()-t0; del x
+
+            elapsed = time.time()-started
+            rate = e/max(elapsed, 1e-9)
+            eta = (n-e)/max(rate, 1e-9)
+            print(f"[FAISS][{self.source}] {e:,}/{n:,} ({100*e/n:6.2f}%) | batch={time.time()-t_batch:.1f}s | vec={v1:.1f}/{v2:.1f}/{v3:.1f}s | add={a1:.1f}/{a2:.1f}/{a3:.1f}s | rate={rate:,.0f} rows/s | ETA={eta/60:.1f}m", flush=True)
+
+            if e % checkpoint_rows == 0 or e == n:
+                self._write_checkpoint({"name": self.name, "unicode": self.name_unicode, "addr": self.addr}, partial, e, expected)
+
+        self.name, self.name_unicode, self.addr = self._to_cpu(self.name), self._to_cpu(self.name_unicode), self._to_cpu(self.addr)
+        self._set_nprobe_cpu()
+        t0 = time.time()
+        for key, idx in (("name", self.name), ("unicode", self.name_unicode), ("addr", self.addr)):
+            tmp = paths[key].with_suffix(paths[key].suffix + ".tmp")
+            faiss.write_index(idx, str(tmp)); tmp.replace(paths[key])
         with open(paths["meta"], "wb") as f:
             pickle.dump(expected, f)
-        print(f"[FAISS] {self.source} indexes saved", flush=True)
+        for p in partial.values():
+            try: p.unlink()
+            except FileNotFoundError: pass
+        print(f"[FAISS][{self.source}] COMPLETE rows={n:,} final_save={time.time()-t0:.1f}s", flush=True)
+
+    def _set_nprobe_cpu(self):
+        """Apply the current search-time nprobe to loaded CPU indexes."""
+        for idx in (self.name, self.name_unicode, self.addr):
+            try:
+                base = faiss.downcast_index(idx.index)
+                base.nprobe = int(self.cfg.ann_nprobe)
+            except Exception:
+                pass
 
     def _enable_gpu(self):
         if not self._gpu_enabled or self._gpu_failed or self._gpu is not None:
@@ -148,14 +266,25 @@ class ANNSourceIndex:
                 print("[FAISS] GPU FAISS bindings unavailable; using CPU", flush=True)
                 self._gpu_failed = True
                 return
-            res = faiss.StandardGpuResources()
-            self._gpu = {
-                "res": res,
-                "name": faiss.index_cpu_to_gpu(res, 0, self.name),
-                "unicode": faiss.index_cpu_to_gpu(res, 0, self.name_unicode),
-                "addr": faiss.index_cpu_to_gpu(res, 0, self.addr),
-            }
-            print("[FAISS] GPU search enabled", flush=True)
+            self._set_nprobe_cpu()
+            ngpu = int(getattr(faiss, "get_num_gpus", lambda: 0)())
+            self._gpu_count = max(1, ngpu)
+            if ngpu >= 2 and hasattr(faiss, "index_cpu_to_all_gpus"):
+                self._gpu = {
+                    "name": faiss.index_cpu_to_all_gpus(self.name),
+                    "unicode": faiss.index_cpu_to_all_gpus(self.name_unicode),
+                    "addr": faiss.index_cpu_to_all_gpus(self.addr),
+                }
+                print(f"[FAISS] Multi-GPU search enabled: {ngpu} GPUs", flush=True)
+            else:
+                res = faiss.StandardGpuResources()
+                self._gpu = {
+                    "res": res,
+                    "name": faiss.index_cpu_to_gpu(res, 0, self.name),
+                    "unicode": faiss.index_cpu_to_gpu(res, 0, self.name_unicode),
+                    "addr": faiss.index_cpu_to_gpu(res, 0, self.addr),
+                }
+                print("[FAISS] GPU search enabled: GPU 0", flush=True)
         except Exception as e:
             print(f"[FAISS] GPU initialization failed -> CPU fallback: {type(e).__name__}: {e}", flush=True)
             self._gpu = None
@@ -238,8 +367,17 @@ class ANNSourceIndex:
 
 
 def build_ann_indexes(s2, s3, index_dir, cfg, force=False):
-    i2 = ANNSourceIndex(s2, Path(index_dir) / "S2", "S2", cfg)
-    i3 = ANNSourceIndex(s3, Path(index_dir) / "S3", "S3", cfg)
-    i2.build(force)
-    i3.build(force)
+    root = Path(index_dir)
+    i2 = ANNSourceIndex(s2, root / "S2", "S2", cfg)
+    i3 = ANNSourceIndex(s3, root / "S3", "S3", cfg)
+    ngpu = int(getattr(faiss, "get_num_gpus", lambda: 0)())
+    if bool(getattr(cfg, "use_faiss_gpu", True)) and ngpu >= 2:
+        print("[FAISS] FAST MODE: S2 -> GPU 0, S3 -> GPU 1, concurrent build", flush=True)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f2 = ex.submit(i2.build, force, 0)
+            f3 = ex.submit(i3.build, force, 1)
+            f2.result(); f3.result()
+    else:
+        print(f"[FAISS] FAST MODE: {ngpu} GPU(s) available; sequential source build", flush=True)
+        i2.build(force, 0); i3.build(force, 0)
     return i2, i3
